@@ -1,0 +1,37 @@
+FROM python:3.13-slim AS sources
+WORKDIR /build
+COPY scripts/patch-staging-dependencies.py /patch-staging-dependencies.py
+RUN python - <<'PYSOURCE'
+import hashlib
+from pathlib import Path
+import subprocess
+import urllib.request
+url = 'https://codeload.github.com/graphhopper/graphhopper/tar.gz/ebb578f4e94db72e82f2f8d3bc69417758e16e1c'
+data = urllib.request.urlopen(url, timeout=60).read()
+assert hashlib.sha256(data).hexdigest() == '10dcaffe1c7edba071ea4fdc19665c43db446098ac43a3df263bac4644008620'
+Path('/source.tar.gz').write_bytes(data)
+subprocess.run(['tar', '-xzf', '/source.tar.gz', '--strip-components=1'], check=True)
+Path('/source.tar.gz').unlink()
+subprocess.run(['python', '/patch-staging-dependencies.py', 'pom.xml'], check=True)
+PYSOURCE
+
+FROM maven:3.9.16-eclipse-temurin-21 AS artifact
+ENV MAVEN_OPTS="-Xmx1536m"
+WORKDIR /build
+COPY --from=sources /build /build
+# Eigene CI- und HTTP-Prüfungen laufen separat gegen die fertige Laufzeit.
+RUN --mount=type=cache,target=/root/.m2 mvn -B -ntp -pl web -am package -DskipTests \
+    && cp web/target/graphhopper-web-*.jar /graphhopper-web.jar
+
+FROM cgr.dev/chainguard/wolfi-base:latest
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk PATH=/usr/lib/jvm/java-21-openjdk/bin:$PATH
+RUN apk add --no-cache openjdk-21-jre \
+    && addgroup -g 10001 appuser && adduser -D -u 10001 -G appuser appuser \
+    && mkdir -p /graphhopper /data && chown 10001:10001 /graphhopper /data
+WORKDIR /graphhopper
+COPY --from=artifact /graphhopper-web.jar ./graphhopper-web.jar
+COPY config.yml ./config.yml
+USER 10001:10001
+EXPOSE 8989
+ENV JAVA_OPTS="-Xms256m -Xmx1250m -XX:+UseG1GC -XX:+UseStringDeduplication"
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar graphhopper-web.jar server /graphhopper/config.yml"]
